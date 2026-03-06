@@ -6,3 +6,6 @@ data.json
 
 *.bak
 *backup*.py
+
+*.bak
+*backup*.py
