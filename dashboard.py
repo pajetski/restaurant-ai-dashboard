@@ -1,22 +1,68 @@
 import json
+import io
+import csv
+import zipfile
+import hashlib
+from datetime import datetime, date
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
 
-from restaurant_ai_app import RestaurantManager, MaintenanceRequest, JobPosting
+from restaurant_ai_app import RestaurantManager, MaintenanceRequest, JobPosting, Platform
 
-
+# ----------------------------
+# Paths / Config
+# ----------------------------
+APP_TITLE = "Restaurant Ops Dashboard"
 DATA_PATH = Path("data.json")
+UPLOAD_DIR = Path("uploads")
+AUDIT_PATH = Path("audit_log.jsonl")
+VENDOR_HISTORY_PATH = Path("vendor_price_history.csv")
+
 OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "qwen2.5:7b"
+DEFAULT_MODEL = "qwen2.5:7b"
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
-# -------------------------
-# Persistence helpers
-# -------------------------
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def log_action(action: str, payload: Dict[str, Any]) -> None:
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    record = {"time": now_iso(), "action": action, "payload": payload}
+    with AUDIT_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def load_audit(limit: int = 200) -> pd.DataFrame:
+    if not AUDIT_PATH.exists():
+        return pd.DataFrame(columns=["time", "action", "payload"])
+    rows = []
+    with AUDIT_PATH.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["time", "action", "payload"])
+    # newest first
+    df = df.sort_values("time", ascending=False).head(limit)
+    return df
+
 
 def manager_to_dict(m: RestaurantManager) -> Dict[str, Any]:
     return {
@@ -26,290 +72,776 @@ def manager_to_dict(m: RestaurantManager) -> Dict[str, Any]:
         "job_postings": [{"action": j.action, "position": j.position, "boards": j.boards} for j in m.job_postings],
         "revenue": m.revenue,
         "expenses": m.expenses,
+        # optional: store simple order log (if you start capturing)
+        "orders": st.session_state.get("orders", []),
     }
 
 
-def load_manager() -> RestaurantManager:
+def dict_to_manager(d: Dict[str, Any]) -> RestaurantManager:
     m = RestaurantManager()
-
-    if not DATA_PATH.exists():
-        # Sample defaults
-        m.add_platform("POS", {"Burger": 9.99, "Fries": 3.49}, "10am–10pm")
-        m.add_platform("Website", {"Burger": 9.99, "Fries": 3.49}, "10am–10pm")
-        m.add_platform("DeliveryApp", {"Burger": 11.99, "Fries": 4.49}, "10am–9pm")
-
-        m.add_vendor_prices("VendorA", {"Grenadine": 12.00, "Plastic Cups": 8.50, "Beef": 5.25})
-        m.add_vendor_prices("VendorB", {"Grenadine": 11.50, "Plastic Cups": 9.00, "Beef": 5.75, "Wine": 14.00})
-        m.add_vendor_prices("VendorC", {"Grenadine": 12.25, "Plastic Cups": 8.00, "Beef": 5.50, "Wine": 13.50})
-        return m
-
-    data = json.loads(DATA_PATH.read_text())
-    for p in data.get("platforms", []):
+    for p in d.get("platforms", []):
         m.add_platform(p["name"], p.get("menu", {}), p.get("hours", ""))
+    m.vendor_prices = d.get("vendor_prices", {}) or {}
+    m.maintenance_requests = [MaintenanceRequest(**r) for r in d.get("maintenance_requests", [])]
+    m.job_postings = [JobPosting(**j) for j in d.get("job_postings", [])]
+    m.revenue = [float(x) for x in d.get("revenue", [])]
+    m.expenses = [float(x) for x in d.get("expenses", [])]
+    st.session_state["orders"] = d.get("orders", [])
+    return m
 
-    m.vendor_prices = data.get("vendor_prices", {})
 
-    m.maintenance_requests = [MaintenanceRequest(**r) for r in data.get("maintenance_requests", [])]
-    m.job_postings = [JobPosting(**j) for j in data.get("job_postings", [])]
+def load_manager() -> RestaurantManager:
+    if DATA_PATH.exists():
+        try:
+            data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+            return dict_to_manager(data)
+        except Exception:
+            pass
 
-    m.revenue = [float(x) for x in data.get("revenue", [])]
-    m.expenses = [float(x) for x in data.get("expenses", [])]
+    # sample defaults if no file
+    m = RestaurantManager()
+    m.add_platform("POS", {"Burger": 9.99, "Fries": 3.49}, "10am–10pm")
+    m.add_platform("Website", {"Burger": 9.99, "Fries": 3.49}, "10am–10pm")
+    m.add_platform("DeliveryApp", {"Burger": 11.99, "Fries": 4.49}, "10am–9pm")
+
+    m.add_vendor_prices("VendorA", {"Grenadine": 12.00, "Plastic Cups": 8.50, "Beef": 5.25})
+    m.add_vendor_prices("VendorB", {"Grenadine": 11.50, "Plastic Cups": 9.00, "Beef": 5.75, "Wine": 14.00})
+    m.add_vendor_prices("VendorC", {"Grenadine": 12.25, "Plastic Cups": 8.00, "Beef": 5.50, "Wine": 13.50})
+
+    st.session_state["orders"] = []
     return m
 
 
 def save_manager(m: RestaurantManager) -> None:
-    DATA_PATH.write_text(json.dumps(manager_to_dict(m), indent=2))
+    DATA_PATH.write_text(json.dumps(manager_to_dict(m), indent=2), encoding="utf-8")
+    log_action("save_data", {"path": str(DATA_PATH)})
 
 
-# -------------------------
-# Ollama helper
-# -------------------------
+def reset_sample() -> RestaurantManager:
+    if DATA_PATH.exists():
+        try:
+            DATA_PATH.unlink()
+        except Exception:
+            pass
+    log_action("reset_sample", {})
+    return load_manager()
 
-def qwen_answer(prompt: str) -> str:
-    r = requests.post(
-        OLLAMA_URL,
-        json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-        timeout=120,
-    )
+
+def ensure_vendor_history_schema() -> None:
+    if VENDOR_HISTORY_PATH.exists():
+        return
+    with VENDOR_HISTORY_PATH.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["time", "vendor", "item", "price"])
+
+
+def append_vendor_history(vendor: str, item: str, price: float) -> None:
+    ensure_vendor_history_schema()
+    with VENDOR_HISTORY_PATH.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([now_iso(), vendor, item, f"{price:.4f}"])
+
+
+def load_vendor_history() -> pd.DataFrame:
+    if not VENDOR_HISTORY_PATH.exists():
+        return pd.DataFrame(columns=["time", "vendor", "item", "price"])
+    try:
+        df = pd.read_csv(VENDOR_HISTORY_PATH)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["time", "vendor", "item", "price"])
+
+
+def detect_cost_creep(df: pd.DataFrame, lookback_rows: int = 2000) -> pd.DataFrame:
+    """
+    Simple cost-creep detector:
+    For each vendor+item, compare latest price vs previous price.
+    """
+    if df.empty:
+        return pd.DataFrame(columns=["vendor", "item", "prev_price", "latest_price", "delta", "delta_pct", "time"])
+    df2 = df.tail(lookback_rows).copy()
+    df2["price"] = pd.to_numeric(df2["price"], errors="coerce")
+    df2 = df2.dropna(subset=["price"])
+    df2 = df2.sort_values("time")
+    # get latest and prev
+    out = []
+    for (vendor, item), g in df2.groupby(["vendor", "item"], dropna=False):
+        if len(g) < 2:
+            continue
+        prev = g.iloc[-2]
+        latest = g.iloc[-1]
+        prev_p = float(prev["price"])
+        latest_p = float(latest["price"])
+        delta = latest_p - prev_p
+        delta_pct = (delta / prev_p) * 100.0 if prev_p != 0 else None
+        out.append(
+            {
+                "vendor": vendor,
+                "item": item,
+                "prev_price": prev_p,
+                "latest_price": latest_p,
+                "delta": delta,
+                "delta_pct": delta_pct,
+                "time": latest["time"],
+            }
+        )
+    res = pd.DataFrame(out)
+    if res.empty:
+        return res
+    res = res.sort_values(["delta_pct", "delta"], ascending=False)
+    return res
+
+
+def ollama_generate(prompt: str, model: str = DEFAULT_MODEL) -> str:
+    payload = {"model": model, "prompt": prompt, "stream": False}
+    r = requests.post(OLLAMA_URL, json=payload, timeout=120)
     r.raise_for_status()
-    return r.json().get("response", "").strip()
+    data = r.json()
+    return data.get("response", "").strip()
 
 
-# -------------------------
-# Streamlit UI
-# -------------------------
+def safe_float(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
 
-st.set_page_config(page_title="Restaurant Ops Dashboard", layout="wide")
-st.title("Restaurant Ops Dashboard")
 
+def parse_actions_json(text: str) -> Dict[str, Any]:
+    """
+    Expect model to return JSON (possibly inside ```json fences).
+    """
+    t = text.strip()
+    if t.startswith("```"):
+        # remove fences
+        t = t.replace("```json", "").replace("```", "").strip()
+    return json.loads(t)
+
+
+def build_context_summary(m: RestaurantManager) -> str:
+    # short, stable business context (keeps prompt size sane)
+    platforms = ", ".join([p.name for p in m.platforms]) if m.platforms else "none"
+    menu_items = sorted({k for p in m.platforms for k in p.menu.keys()})
+    menu_preview = ", ".join(menu_items[:20]) + ("..." if len(menu_items) > 20 else "")
+    rev = sum(m.revenue)
+    exp = sum(m.expenses)
+    profit = rev - exp
+    return (
+        f"Platforms: {platforms}\n"
+        f"Menu items: {menu_preview if menu_preview else 'none'}\n"
+        f"Revenue total: {rev:.2f}\n"
+        f"Expenses total: {exp:.2f}\n"
+        f"Profit total: {profit:.2f}\n"
+        f"Vendors tracked: {', '.join(m.vendor_prices.keys()) if m.vendor_prices else 'none'}\n"
+    )
+
+
+def execute_actions(m: RestaurantManager, actions: List[Dict[str, Any]]) -> List[str]:
+    """
+    Minimal “Action Agent” executor.
+    We intentionally keep actions narrow + safe (no OS commands, no network writes beyond local json).
+    """
+    results = []
+    for a in actions:
+        atype = a.get("type")
+        try:
+            if atype == "set_hours":
+                hours = str(a.get("hours", "")).strip()
+                if not hours:
+                    results.append("Skipped set_hours (missing hours).")
+                    continue
+                for p in m.platforms:
+                    p.set_hours(hours)
+                results.append(f"Set hours on all platforms to: {hours}")
+                log_action("agent_set_hours", {"hours": hours})
+
+            elif atype == "update_menu_price":
+                item = str(a.get("item", "")).strip()
+                price = safe_float(a.get("price"))
+                if not item or price is None:
+                    results.append("Skipped update_menu_price (missing item or price).")
+                    continue
+                for p in m.platforms:
+                    p.update_menu_item(item, float(price))
+                results.append(f"Updated menu price: {item} = ${float(price):.2f} across platforms")
+                log_action("agent_update_menu_price", {"item": item, "price": float(price)})
+
+            elif atype == "add_vendor_price":
+                vendor = str(a.get("vendor", "")).strip()
+                item = str(a.get("item", "")).strip()
+                price = safe_float(a.get("price"))
+                if not vendor or not item or price is None:
+                    results.append("Skipped add_vendor_price (missing vendor/item/price).")
+                    continue
+                if vendor not in m.vendor_prices:
+                    m.vendor_prices[vendor] = {}
+                m.vendor_prices[vendor][item] = float(price)
+                append_vendor_history(vendor, item, float(price))
+                results.append(f"Saved vendor price: {vendor} → {item} = ${float(price):.2f}")
+                log_action("agent_add_vendor_price", {"vendor": vendor, "item": item, "price": float(price)})
+
+            elif atype == "record_sale":
+                amt = safe_float(a.get("amount"))
+                if amt is None or amt <= 0:
+                    results.append("Skipped record_sale (invalid amount).")
+                    continue
+                m.revenue.append(float(amt))
+                results.append(f"Recorded sale: ${float(amt):.2f}")
+                log_action("agent_record_sale", {"amount": float(amt)})
+
+            elif atype == "record_expense":
+                amt = safe_float(a.get("amount"))
+                if amt is None or amt <= 0:
+                    results.append("Skipped record_expense (invalid amount).")
+                    continue
+                m.expenses.append(float(amt))
+                results.append(f"Recorded expense: ${float(amt):.2f}")
+                log_action("agent_record_expense", {"amount": float(amt)})
+
+            else:
+                results.append(f"Unknown action type: {atype}")
+        except Exception as e:
+            results.append(f"Action failed ({atype}): {e}")
+    return results
+
+
+def export_zip(m: RestaurantManager) -> bytes:
+    """
+    ZIP for accountants / ops:
+    - data.json
+    - audit_log.jsonl
+    - vendor_price_history.csv
+    - orders.csv (if present)
+    """
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("data.json", json.dumps(manager_to_dict(m), indent=2))
+
+        if AUDIT_PATH.exists():
+            z.writestr("audit_log.jsonl", AUDIT_PATH.read_text(encoding="utf-8"))
+        else:
+            z.writestr("audit_log.jsonl", "")
+
+        if VENDOR_HISTORY_PATH.exists():
+            z.writestr("vendor_price_history.csv", VENDOR_HISTORY_PATH.read_text(encoding="utf-8"))
+        else:
+            z.writestr("vendor_price_history.csv", "time,vendor,item,price\n")
+
+        # Orders
+        orders = st.session_state.get("orders", [])
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["time", "platform", "item", "qty"])
+        for o in orders:
+            w.writerow([o.get("time"), o.get("platform"), o.get("item"), o.get("qty")])
+        z.writestr("orders.csv", out.getvalue())
+
+        # Upload index (if exists)
+        upload_index = Path("upload_queue.jsonl")
+        if upload_index.exists():
+            z.writestr("upload_queue.jsonl", upload_index.read_text(encoding="utf-8"))
+        else:
+            z.writestr("upload_queue.jsonl", "")
+
+    mem.seek(0)
+    return mem.read()
+
+
+UPLOAD_QUEUE_PATH = Path("upload_queue.jsonl")
+
+
+def enqueue_upload(meta: Dict[str, Any]) -> None:
+    UPLOAD_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with UPLOAD_QUEUE_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(meta) + "\n")
+
+
+# ----------------------------
+# Page
+# ----------------------------
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.title(APP_TITLE)
+
+# Load manager once per session
 if "manager" not in st.session_state:
     st.session_state.manager = load_manager()
 
 manager: RestaurantManager = st.session_state.manager
 
-col1, col2, col3 = st.columns([1, 1, 2])
-with col1:
+# Top actions
+c1, c2, c3, c4 = st.columns([1, 1, 1.4, 2.6])
+with c1:
     if st.button("Save data", width="stretch"):
         save_manager(manager)
-        st.success("Saved")
-with col2:
+        st.success("Saved.")
+with c2:
     if st.button("Reload", width="stretch"):
         st.session_state.manager = load_manager()
-        st.rerun()
-with col3:
+        manager = st.session_state.manager
+        st.success("Reloaded.")
+with c3:
+    if st.button("Reset to sample (no save)", width="stretch"):
+        st.session_state.manager = reset_sample()
+        manager = st.session_state.manager
+        st.success("Reset.")
+with c4:
     st.caption(f"Data file: {DATA_PATH.resolve()}")
 
-tabs = st.tabs(["Platforms", "Menu", "Hours", "Vendors", "Weekly Order", "Maintenance", "Hiring", "Finance", "AI Assistant"])
+st.divider()
 
-# -------------------------
+# ----------------------------
+# Tabs
+# ----------------------------
+tabs = st.tabs(
+    [
+        "Platforms",
+        "Menu",
+        "Hours",
+        "Vendors",
+        "Weekly Order",
+        "Maintenance",
+        "Hiring",
+        "Finance",
+        "AI Ops",
+        "Audit & Export",
+    ]
+)
+
+# ----------------------------
 # Platforms
-# -------------------------
+# ----------------------------
 with tabs[0]:
     st.header("Platforms")
-    rows = [{"Platform": p.name, "Hours": p.hours, "Menu Items": len(p.menu)} for p in manager.platforms]
-    st.dataframe(pd.DataFrame(rows), width="stretch")
+    st.caption("Registered platforms and current hours.")
+
+    plat_rows = []
+    for p in manager.platforms:
+        plat_rows.append({"Platform": p.name, "Hours": p.hours, "Menu Items": len(p.menu)})
+    dfp = pd.DataFrame(plat_rows) if plat_rows else pd.DataFrame(columns=["Platform", "Hours", "Menu Items"])
+    st.dataframe(dfp, width="stretch", hide_index=True)
 
     st.subheader("Add platform")
-    new_name = st.text_input("Platform name", placeholder="e.g., Toast POS, Website, DoorDash", key="plat_name")
-    new_hours = st.text_input("Hours", placeholder="e.g., 11am–9pm", key="plat_hours")
-    if st.button("Add", key="plat_add"):
-        if new_name.strip():
-            manager.add_platform(new_name.strip(), {}, new_hours.strip())
-            st.success("Platform added")
+    name = st.text_input("Platform name", placeholder="e.g., Toast POS, Website, DoorDash", key="add_plat_name")
+    hours = st.text_input("Hours", placeholder="e.g., 11am–9pm", key="add_plat_hours")
+    if st.button("Add", key="add_plat_btn"):
+        if name.strip():
+            manager.add_platform(name.strip(), {}, hours.strip())
+            log_action("add_platform", {"name": name.strip(), "hours": hours.strip()})
+            st.success("Added.")
         else:
-            st.error("Platform name required")
+            st.error("Platform name required.")
 
-# -------------------------
+# ----------------------------
 # Menu
-# -------------------------
+# ----------------------------
 with tabs[1]:
     st.header("Menu")
-    all_items = {}
-    for p in manager.platforms:
-        for k, v in p.menu.items():
-            all_items.setdefault(k, []).append((p.name, v))
+    st.caption("Edit menu items. Changes apply to all platforms.")
 
-    items = [{"Item": k, "Prices": ", ".join([f"{pn}: ${pv:.2f}" for pn, pv in v])} for k, v in all_items.items()]
-    st.dataframe(pd.DataFrame(items), width="stretch")
+    all_items = sorted({k for p in manager.platforms for k in p.menu.keys()})
+    colA, colB, colC = st.columns([1.2, 1, 1])
+    with colA:
+        item = st.selectbox("Menu item", options=(all_items if all_items else ["(none yet)"]), key="menu_item")
+    with colB:
+        new_item = st.text_input("Or new item", placeholder="e.g., Margarita", key="new_menu_item")
+    with colC:
+        price = st.number_input("Price", min_value=0.0, value=0.0, step=0.25, key="menu_price")
 
-    st.subheader("Update menu item across all platforms")
-    item = st.text_input("Item", placeholder="e.g., Fries", key="menu_item")
-    price = st.number_input("New price", value=0.0, step=0.25, key="menu_price")
-    if st.button("Update price", key="menu_update"):
-        if item.strip() and price > 0:
-            manager.update_menu_item(item.strip(), float(price))
-            st.success("Updated across platforms")
+    if st.button("Set price across platforms", key="menu_set_price"):
+        chosen = new_item.strip() if new_item.strip() else item
+        if not chosen or chosen == "(none yet)":
+            st.error("Choose or enter a menu item.")
         else:
-            st.error("Item and a price > 0 are required")
+            for p in manager.platforms:
+                p.update_menu_item(chosen, float(price))
+            log_action("set_menu_price", {"item": chosen, "price": float(price)})
+            st.success(f"Updated {chosen} to ${price:.2f} across platforms.")
 
-# -------------------------
+    # show consolidated menu (average if inconsistent)
+    st.subheader("Current consolidated menu")
+    rows = []
+    for it in sorted({k for p in manager.platforms for k in p.menu.keys()}):
+        prices = [p.menu.get(it) for p in manager.platforms if it in p.menu]
+        rows.append({"Item": it, "Prices (by platform)": prices})
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+# ----------------------------
 # Hours
-# -------------------------
+# ----------------------------
 with tabs[2]:
     st.header("Hours")
-    hours = st.text_input("Set business hours across all platforms", placeholder="e.g., 11am–9pm", key="hours_all")
-    if st.button("Update hours", key="hours_update"):
+    st.caption("Set business hours across all platforms.")
+    hours = st.text_input("Hours", placeholder="e.g., 11am–9pm", key="hours_all")
+    if st.button("Apply hours to all platforms", key="hours_apply"):
         if hours.strip():
-            manager.set_business_hours(hours.strip())
-            st.success("Hours updated")
+            for p in manager.platforms:
+                p.set_hours(hours.strip())
+            log_action("set_hours_all", {"hours": hours.strip()})
+            st.success("Updated hours.")
         else:
-            st.error("Hours required")
+            st.error("Enter hours.")
 
-# -------------------------
+# ----------------------------
 # Vendors
-# -------------------------
+# ----------------------------
 with tabs[3]:
     st.header("Vendors")
-    vendor_names = sorted(manager.vendor_prices.keys())
-    st.write("Current vendors:", ", ".join(vendor_names) if vendor_names else "None")
+    st.caption("Track vendor prices and history (detects cost creep).")
 
-    st.subheader("Add/Update vendor price list")
-    vname = st.text_input("Vendor name", placeholder="e.g., VendorA", key="vendor_name")
-    raw = st.text_area("Prices (one per line: item=price)", placeholder="Beef=5.25\nWine=13.50", key="vendor_prices")
-    if st.button("Save vendor prices", key="vendor_save"):
-        if not vname.strip():
-            st.error("Vendor name required")
+    vendor = st.text_input("Vendor", placeholder="e.g., US Foods", key="vendor_name")
+    item = st.text_input("Item", placeholder="e.g., Beef", key="vendor_item")
+    price = st.number_input("Price", min_value=0.0, value=0.0, step=0.01, key="vendor_price")
+    if st.button("Save vendor price", key="vendor_save"):
+        if vendor.strip() and item.strip() and price > 0:
+            manager.vendor_prices.setdefault(vendor.strip(), {})[item.strip()] = float(price)
+            append_vendor_history(vendor.strip(), item.strip(), float(price))
+            log_action("vendor_price_update", {"vendor": vendor.strip(), "item": item.strip(), "price": float(price)})
+            st.success("Saved.")
         else:
-            prices = {}
-            for line in raw.splitlines():
-                line = line.strip()
-                if not line or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                k = k.strip()
-                try:
-                    prices[k] = float(v.strip())
-                except ValueError:
-                    st.error(f"Bad price line: {line}")
-                    prices = None
-                    break
-            if prices is not None:
-                manager.add_vendor_prices(vname.strip(), prices)
-                st.success("Vendor prices saved")
+            st.error("Vendor, item, and a price > 0 are required.")
 
-# -------------------------
+    st.subheader("Current vendor prices")
+    rows = []
+    for v, plist in (manager.vendor_prices or {}).items():
+        for it, pr in (plist or {}).items():
+            rows.append({"Vendor": v, "Item": it, "Price": pr})
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    st.subheader("Vendor price history + cost creep")
+    hist = load_vendor_history()
+    st.dataframe(hist.tail(200), width="stretch", hide_index=True)
+
+    creep = detect_cost_creep(hist)
+    if creep.empty:
+        st.info("No cost-creep signals yet (need at least two price points per vendor+item).")
+    else:
+        st.warning("Potential cost creep (latest vs previous):")
+        st.dataframe(creep.head(50), width="stretch", hide_index=True)
+
+# ----------------------------
 # Weekly Order
-# -------------------------
+# ----------------------------
 with tabs[4]:
     st.header("Weekly Order")
-    items = st.text_area("Items (one per line)", placeholder="Grenadine\nPlastic Cups\nBeef\nWine", key="order_items")
-    if st.button("Compile weekly order", key="order_compile"):
-        req_items = [x.strip() for x in items.splitlines() if x.strip()]
-        if not req_items:
-            st.error("Add at least one item")
-        else:
-            order = manager.compile_weekly_order(req_items)
-            out_rows = []
-            for vendor, lst in order.items():
-                for it, pr in lst:
-                    out_rows.append({"Vendor": vendor, "Item": it, "Price": pr})
-            st.dataframe(pd.DataFrame(out_rows), width="stretch")
+    st.caption("Pick items and get lowest-cost vendor per item.")
 
-# -------------------------
+    items = sorted({k for v in (manager.vendor_prices or {}).values() for k in (v or {}).keys()})
+    chosen = st.multiselect("Items to order", options=items, key="weekly_items")
+    if st.button("Compare & compile order", key="weekly_compile"):
+        if not chosen:
+            st.error("Select at least one item.")
+        else:
+            # use RestaurantManager logic
+            res = manager.compare_prices(chosen)
+            order: Dict[str, List[Tuple[str, float]]] = {}
+            for it, (vend, pr) in res.items():
+                order.setdefault(vend, []).append((it, pr))
+
+            st.subheader("Recommended order (by vendor)")
+            for vend, items_list in order.items():
+                subtotal = sum(p for _, p in items_list)
+                st.write(f"**{vend}** — subtotal ${subtotal:.2f}")
+                st.dataframe(pd.DataFrame(items_list, columns=["Item", "Price"]), width="stretch", hide_index=True)
+
+            log_action("compile_weekly_order", {"items": chosen, "vendors": list(order.keys())})
+
+# ----------------------------
 # Maintenance
-# -------------------------
+# ----------------------------
 with tabs[5]:
     st.header("Maintenance")
-    m_rows = [{"Issue": r.description, "Contact": r.contact} for r in manager.maintenance_requests]
-    st.dataframe(pd.DataFrame(m_rows), width="stretch")
-
-    st.subheader("Log maintenance issue")
-    desc = st.text_input("Issue", placeholder="Walk-in cooler not cooling", key="mnt_desc")
-    contact = st.text_input("Who to notify", placeholder="Refrigeration contractor", key="mnt_contact")
-    if st.button("Log issue", key="mnt_log"):
+    desc = st.text_input("Issue description", placeholder="e.g., Walk-in cooler not cooling", key="maint_desc")
+    contact = st.text_input("Contact / vendor", placeholder="e.g., Refrigeration contractor", key="maint_contact")
+    if st.button("Log maintenance issue", key="maint_log"):
         if desc.strip() and contact.strip():
-            manager.report_maintenance_issue(desc.strip(), contact.strip())
-            st.success("Logged")
+            manager.maintenance_requests.append(MaintenanceRequest(description=desc.strip(), contact=contact.strip()))
+            log_action("maintenance_log", {"description": desc.strip(), "contact": contact.strip()})
+            st.success("Logged.")
         else:
-            st.error("Issue and contact required")
+            st.error("Description and contact required.")
 
-# -------------------------
+    st.subheader("Open requests")
+    st.dataframe(
+        pd.DataFrame([r.__dict__ for r in manager.maintenance_requests]),
+        width="stretch",
+        hide_index=True,
+    )
+
+# ----------------------------
 # Hiring
-# -------------------------
+# ----------------------------
 with tabs[6]:
-    st.header("Hiring / Termination")
-    j_rows = [{"Action": j.action, "Position": j.position, "Boards": ", ".join(j.boards)} for j in manager.job_postings]
-    st.dataframe(pd.DataFrame(j_rows), width="stretch")
-
-    st.subheader("Post job update")
-    action = st.selectbox("Action", ["hire", "fire"], key="job_action")
-    position = st.text_input("Position", placeholder="Line Cook", key="job_position")
-    boards = st.text_input("Boards (comma separated)", placeholder="Indeed, Craigslist, Company Site", key="job_boards")
-    if st.button("Post update", key="job_post"):
+    st.header("Hiring / HR")
+    action = st.selectbox("Action", options=["hire", "fire"], key="hr_action")
+    position = st.text_input("Position", placeholder="e.g., Line Cook", key="hr_position")
+    boards = st.text_input("Boards (comma-separated)", placeholder="Indeed, Craigslist, Company Site", key="hr_boards")
+    if st.button("Record HR update", key="hr_record"):
         b = [x.strip() for x in boards.split(",") if x.strip()]
         if position.strip() and b:
-            manager.post_job_update(action, position.strip(), b)
-            st.success("Posted (demo)")
+            manager.job_postings.append(JobPosting(action=action, position=position.strip(), boards=b))
+            log_action("hr_update", {"action": action, "position": position.strip(), "boards": b})
+            st.success("Recorded.")
         else:
-            st.error("Position and at least one board required")
+            st.error("Position and at least one board required.")
 
-# -------------------------
+    st.subheader("History")
+    st.dataframe(pd.DataFrame([j.__dict__ for j in manager.job_postings]), width="stretch", hide_index=True)
+
+# ----------------------------
 # Finance
-# -------------------------
+# ----------------------------
 with tabs[7]:
     st.header("Finance")
-    st.subheader("Revenue")
-    sale = st.number_input("Add sale", value=0.0, step=10.0, key="fin_sale")
-    if st.button("Record sale", key="fin_sale_btn"):
-        if sale > 0:
-            manager.record_sale(float(sale))
-            st.success("Revenue recorded")
-        else:
-            st.error("Sale must be > 0")
+    st.caption("Simple revenue/expense tracking + P&L.")
 
-    st.subheader("Expenses")
-    expense = st.number_input("Add expense", value=0.0, step=10.0, key="fin_expense")
-    if st.button("Record expense", key="fin_exp_btn"):
-        if expense > 0:
-            manager.record_expense(float(expense))
-            st.success("Expense recorded")
-        else:
-            st.error("Expense must be > 0")
+    cA, cB = st.columns(2)
+    with cA:
+        st.subheader("Revenue")
+        sale = st.number_input("Add sale", min_value=0.0, value=0.0, step=10.0, key="sale_amt")
+        if st.button("Record sale", key="sale_btn"):
+            if sale > 0:
+                manager.revenue.append(float(sale))
+                log_action("record_sale", {"amount": float(sale)})
+                st.success("Recorded.")
+            else:
+                st.error("Sale must be > 0")
+    with cB:
+        st.subheader("Expenses")
+        expense = st.number_input("Add expense", min_value=0.0, value=0.0, step=10.0, key="exp_amt")
+        if st.button("Record expense", key="exp_btn"):
+            if expense > 0:
+                manager.expenses.append(float(expense))
+                log_action("record_expense", {"amount": float(expense)})
+                st.success("Recorded.")
+            else:
+                st.error("Expense must be > 0")
 
     st.divider()
     st.subheader("Profit & Loss")
-    if st.button("Generate P&L", key="fin_pnl"):
-        rev, exp, profit = manager.generate_pnl()
-        st.metric("Revenue", f"${rev:.2f}")
-        st.metric("Expenses", f"${exp:.2f}")
-        st.metric("Profit", f"${profit:.2f}")
+    rev = sum(manager.revenue)
+    exp = sum(manager.expenses)
+    prof = rev - exp
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Revenue", f"${rev:,.2f}")
+    m2.metric("Expenses", f"${exp:,.2f}")
+    m3.metric("Profit", f"${prof:,.2f}")
 
-# -------------------------
-# AI Assistant
-# -------------------------
+# ----------------------------
+# AI Ops (Speech bubble + Upload)
+# ----------------------------
 with tabs[8]:
-    st.header("AI Assistant (Qwen)")
+    st.header("AI Ops")
 
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+    left, right = st.columns([1.15, 0.85], gap="large")
 
-    question = st.text_input("Ask the AI about your restaurant", key="ai_q")
+    # ---------------- Speech bubble chat ----------------
+    with left:
+        # speech-bubble style container
+        st.markdown(
+            """
+            <div style="
+                border:1px solid rgba(255,255,255,0.12);
+                background: rgba(255,255,255,0.03);
+                padding: 18px;
+                border-radius: 14px;
+                position: relative;
+            ">
+              <div style="font-size: 18px; font-weight: 700; margin-bottom: 6px;">
+                Ask me things about your restaurant
+              </div>
+              <div style="opacity: 0.8; margin-bottom: 12px;">
+                Try: <b>What should I reorder this week?</b>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    if st.button("Ask AI", key="ai_ask"):
-        if question.strip():
-            try:
-                prompt = f"""
-You are an assistant helping manage a restaurant.
+        if "chat_history" not in st.session_state:
+            st.session_state.chat_history = []
 
-Current totals:
-Revenue: {sum(manager.revenue):.2f}
-Expenses: {sum(manager.expenses):.2f}
-Profit: {(sum(manager.revenue) - sum(manager.expenses)):.2f}
+        model = st.text_input("Model", value=DEFAULT_MODEL, key="ai_model")
+        question = st.text_input("Your question", placeholder="What should I reorder this week?", key="ai_question")
 
-Question:
-{question}
+        def build_ai_prompt(user_q: str) -> str:
+            ctx = build_context_summary(manager)
+            vendor_hist = load_vendor_history().tail(50)
+            creep = detect_cost_creep(load_vendor_history()).head(20)
+            return (
+                "You are an AI operations assistant for a restaurant.\n"
+                "Goal: give actionable ops guidance (inventory, ordering, staffing, pricing).\n"
+                "If uncertain, ask ONE clarifying question.\n\n"
+                "CURRENT STATE\n"
+                f"{ctx}\n"
+                "VENDOR HISTORY (recent rows)\n"
+                f"{vendor_hist.to_csv(index=False) if not vendor_hist.empty else 'none'}\n"
+                "COST CREEP SIGNALS\n"
+                f"{creep.to_csv(index=False) if not creep.empty else 'none'}\n\n"
+                "When appropriate, output a JSON block with suggested actions.\n"
+                "Allowed actions:\n"
+                "- set_hours: {type:'set_hours', hours:'11am–9pm'}\n"
+                "- update_menu_price: {type:'update_menu_price', item:'Fries', price:3.99}\n"
+                "- add_vendor_price: {type:'add_vendor_price', vendor:'VendorA', item:'Beef', price:5.25}\n"
+                "- record_sale: {type:'record_sale', amount:1500}\n"
+                "- record_expense: {type:'record_expense', amount:500}\n\n"
+                "RESPONSE FORMAT\n"
+                "1) Plain-English answer.\n"
+                "2) OPTIONAL JSON on its own line (or fenced) like:\n"
+                "{\"actions\":[{...}]}\n\n"
+                f"USER QUESTION: {user_q}\n"
+            )
 
-Answer clearly and concisely.
-""".strip()
+        ask_col, act_col = st.columns([1, 1])
+        with ask_col:
+            if st.button("Ask AI", key="ai_ask_btn", width="stretch"):
+                if not question.strip():
+                    st.error("Ask a question.")
+                else:
+                    prompt = build_ai_prompt(question.strip())
+                    with st.spinner("Thinking..."):
+                        try:
+                            answer = ollama_generate(prompt, model=model.strip() or DEFAULT_MODEL)
+                            st.session_state.chat_history.append(("You", question.strip()))
+                            st.session_state.chat_history.append(("AI", answer))
+                            log_action("ai_ask", {"question": question.strip(), "model": model.strip()})
+                        except Exception as e:
+                            st.error(f"AI error: {e}")
 
-                with st.spinner("Thinking..."):
-                    answer = qwen_answer(prompt)
+        with act_col:
+            if st.button("Approve suggested actions (if any)", key="ai_apply_btn", width="stretch"):
+                # find latest AI message with JSON
+                ai_msgs = [m for role, m in st.session_state.chat_history if role == "AI"]
+                if not ai_msgs:
+                    st.warning("No AI responses yet.")
+                else:
+                    latest = ai_msgs[-1]
+                    # attempt to extract JSON by scanning for first '{' to last '}'
+                    try:
+                        s = latest
+                        start = s.find("{")
+                        end = s.rfind("}")
+                        if start == -1 or end == -1 or end <= start:
+                            st.warning("No JSON actions found in the latest AI response.")
+                        else:
+                            candidate = s[start : end + 1]
+                            obj = parse_actions_json(candidate)
+                            actions = obj.get("actions", [])
+                            if not actions:
+                                st.warning("JSON found but no actions listed.")
+                            else:
+                                results = execute_actions(manager, actions)
+                                save_manager(manager)
+                                st.success("Applied actions.")
+                                st.write(results)
+                    except Exception as e:
+                        st.error(f"Could not parse/apply actions: {e}")
 
-                st.session_state.chat_history.append(("You", question))
-                st.session_state.chat_history.append(("AI", answer))
+        st.divider()
+        for role, msg in st.session_state.chat_history[-20:]:
+            st.markdown(f"**{role}:** {msg}")
 
-            except Exception as e:
-                st.error(f"AI error: {e}")
+    # ---------------- Upload section ----------------
+    with right:
+        st.subheader("Upload files")
 
-    for role, msg in st.session_state.chat_history:
-        st.markdown(f"**{role}:** {msg}")
+        ingest_choice = st.selectbox(
+            "What is this file mostly about?",
+            [
+                "Auto-detect (recommended)",
+                "Menu / pricing",
+                "Vendor invoices / price sheets",
+                "Inventory counts",
+                "Sales reports (daily/weekly/monthly)",
+                "Payroll / labor",
+                "Other",
+            ],
+            index=0,
+            key="ingest_choice",
+        )
+
+        uploaded = st.file_uploader(
+            "Upload files",
+            type=["pdf", "png", "jpg", "jpeg", "csv", "txt"],
+            accept_multiple_files=True,
+            key="upload_files",
+        )
+
+        # ✅ requested placement: under the uploader
+        st.markdown(
+            "**Feed me files about your business**\n\n"
+            "You can add PDF, JPEG, PNG, etc. The AI will sort it out into the right sections."
+        )
+
+        if uploaded:
+            UPLOAD_DIR.mkdir(exist_ok=True)
+            for f in uploaded:
+                content = f.getvalue()
+                file_hash = sha256_bytes(content)
+                save_path = UPLOAD_DIR / f"{file_hash}_{f.name}"
+                save_path.write_bytes(content)
+
+                enqueue_upload(
+                    {
+                        "time": now_iso(),
+                        "filename": f.name,
+                        "stored_as": str(save_path),
+                        "sha256": file_hash,
+                        "size_bytes": len(content),
+                        "label": ingest_choice,
+                    }
+                )
+
+            log_action("upload_files", {"count": len(uploaded), "label": ingest_choice})
+            st.success(f"Queued {len(uploaded)} file(s) for ingest.")
+
+# ----------------------------
+# Audit & Export
+# ----------------------------
+with tabs[9]:
+    st.header("Audit & Export")
+
+    st.subheader("Audit log")
+    adf = load_audit(limit=400)
+    st.dataframe(adf, width="stretch", hide_index=True)
+
+    st.subheader("Export")
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        if st.button("Download audit_log.jsonl", key="dl_audit", width="stretch"):
+            pass
+        if AUDIT_PATH.exists():
+            st.download_button(
+                "Download audit_log.jsonl",
+                data=AUDIT_PATH.read_bytes(),
+                file_name="audit_log.jsonl",
+                mime="application/jsonl",
+                key="audit_dl_btn",
+                width="stretch",
+            )
+        else:
+            st.info("No audit log yet.")
+    with c2:
+        if VENDOR_HISTORY_PATH.exists():
+            st.download_button(
+                "Download vendor_price_history.csv",
+                data=VENDOR_HISTORY_PATH.read_bytes(),
+                file_name="vendor_price_history.csv",
+                mime="text/csv",
+                key="vendorhist_dl_btn",
+                width="stretch",
+            )
+        else:
+            st.info("No vendor history yet.")
+    with c3:
+        z = export_zip(manager)
+        st.download_button(
+            "Download Accountant ZIP",
+            data=z,
+            file_name=f"restaurant_export_{date.today().isoformat()}.zip",
+            mime="application/zip",
+            key="zip_dl_btn",
+            width="stretch",
+        )
+        st.caption("Includes data.json, audit log, vendor history, orders.csv, and upload queue index.")
+
+st.caption("Tip: changes are only persisted when you click **Save data** (or the agent auto-saves after applying actions).")
