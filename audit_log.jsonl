@@ -1,0 +1,2 @@
+{"time": "2026-03-06T00:01:39", "action": "order_added", "payload": {"time": "2026-03-06T00:01:39", "platform": "POS", "item": "Burger", "qty": 2.0}}
+{"time": "2026-03-06T00:01:39", "action": "save_data", "payload": {"path": "data.json"}}
