@@ -39,6 +39,16 @@ def _read_queue_records(queue_path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _write_queue_records(queue_path: Path, records: list[dict[str, Any]]) -> None:
+    """Safely rewrite queue JSONL with updated records."""
+    temp_path = queue_path.with_suffix(f"{queue_path.suffix}.tmp")
+    with temp_path.open("w", encoding="utf-8") as queue_file:
+        for record in records:
+            queue_file.write(json.dumps(record, ensure_ascii=False))
+            queue_file.write("\n")
+    temp_path.replace(queue_path)
+
+
 def _references_pdf(record: dict[str, Any]) -> bool:
     """Return True when a queue record appears to reference a PDF upload."""
     record_text = json.dumps(record, ensure_ascii=False).lower()
@@ -69,6 +79,11 @@ def _record_sha256(record: dict[str, Any]) -> str:
     return ""
 
 
+def _record_processed(record: dict[str, Any]) -> bool:
+    """Return True when a queue record is already marked as processed."""
+    return record.get("processed") is True
+
+
 def main() -> None:
     """Run the ingestion worker entrypoint."""
     queue_records = _read_queue_records(QUEUE_PATH)
@@ -79,6 +94,9 @@ def main() -> None:
     seen_hashes: set[str] = set()
 
     for record in pdf_records:
+        if _record_processed(record):
+            continue
+
         filename = _record_filename(record)
         if "menu" in filename.lower():
             skipped_menu_records += 1
@@ -106,12 +124,19 @@ def main() -> None:
     for record in unique_invoice_like_records:
         display_name = _record_filename(record)
         stored_as = _record_stored_path(record)
+        sha256 = _record_sha256(record)
 
         print(f"Processing record: {display_name} | stored path: {stored_as}")
         try:
             intake_service.parse_supplier_invoice_pdf(stored_as)
+            record["processed"] = True
+            for queued_record in queue_records:
+                if _record_sha256(queued_record) == sha256:
+                    queued_record["processed"] = True
         except Exception as exc:  # noqa: BLE001
             print(f"Failed to parse {display_name} ({stored_as}): {exc}")
+
+    _write_queue_records(QUEUE_PATH, queue_records)
 
     # TODO: Log parsing and ingestion results.
     # TODO: Mark processed queue records as completed.
