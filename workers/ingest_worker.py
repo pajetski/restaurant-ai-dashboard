@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from services.receiving.service import ReceivingIntakeService
+
 QUEUE_PATH = Path("upload_queue.jsonl")
 
 
@@ -43,13 +45,28 @@ def _references_pdf(record: dict[str, Any]) -> bool:
     return ".pdf" in record_text
 
 
-def _record_label(record: dict[str, Any]) -> str:
-    """Extract a path-like label from a queue record for display."""
-    for key in ("path", "file_path", "filepath", "filename", "file", "name", "upload_path"):
-        value = record.get(key)
-        if isinstance(value, str) and value.strip():
-            return value
-    return "<path-or-filename-unavailable>"
+def _record_filename(record: dict[str, Any]) -> str:
+    """Extract the original filename from a queue record."""
+    filename = record.get("filename")
+    if isinstance(filename, str) and filename.strip():
+        return filename
+    return ""
+
+
+def _record_stored_path(record: dict[str, Any]) -> str:
+    """Extract stored file path from a queue record."""
+    stored_as = record.get("stored_as")
+    if isinstance(stored_as, str) and stored_as.strip():
+        return stored_as
+    return ""
+
+
+def _record_sha256(record: dict[str, Any]) -> str:
+    """Extract sha256 digest from a queue record."""
+    sha256 = record.get("sha256")
+    if isinstance(sha256, str) and sha256.strip():
+        return sha256.lower()
+    return ""
 
 
 def main() -> None:
@@ -57,13 +74,45 @@ def main() -> None:
     queue_records = _read_queue_records(QUEUE_PATH)
     pdf_records = [record for record in queue_records if _references_pdf(record)]
 
-    print(f"Total queue records: {len(queue_records)}")
-    print(f"Total PDF records: {len(pdf_records)}")
+    skipped_menu_records = 0
+    unique_invoice_like_records: list[dict[str, Any]] = []
+    seen_hashes: set[str] = set()
 
     for record in pdf_records:
-        print(f"PDF record: {_record_label(record)}")
+        filename = _record_filename(record)
+        if "menu" in filename.lower():
+            skipped_menu_records += 1
+            continue
 
-    # TODO: Call ReceivingService.parse_supplier_invoice_pdf() for each PDF item.
+        stored_as = _record_stored_path(record)
+        sha256 = _record_sha256(record)
+
+        if not filename or not stored_as or not sha256:
+            continue
+
+        if sha256 in seen_hashes:
+            continue
+
+        seen_hashes.add(sha256)
+        unique_invoice_like_records.append(record)
+
+    print(f"Total queue records: {len(queue_records)}")
+    print(f"Total PDF records: {len(pdf_records)}")
+    print(f"Total skipped menu records: {skipped_menu_records}")
+    print(f"Total unique invoice-like PDF records: {len(unique_invoice_like_records)}")
+
+    intake_service = ReceivingIntakeService()
+
+    for record in unique_invoice_like_records:
+        display_name = _record_filename(record)
+        stored_as = _record_stored_path(record)
+
+        print(f"Processing record: {display_name} | stored path: {stored_as}")
+        try:
+            intake_service.parse_supplier_invoice_pdf(stored_as)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Failed to parse {display_name} ({stored_as}): {exc}")
+
     # TODO: Log parsing and ingestion results.
     # TODO: Mark processed queue records as completed.
 
