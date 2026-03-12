@@ -1,3 +1,113 @@
+# D.U.D.E. Restaurant AI — Current State
+
+## Project
+
+Restaurant AI Operations Dashboard
+Codename: **D.U.D.E. (Data Understanding Direction Execution)**
+
+Repository:
+restaurant_ai_dashboard
+
+---
+
+# Current System Status
+
+Working components:
+
+• Streamlit dashboard UI (`dashboard.py`)
+• Restaurant manager logic (`restaurant_ai_app.py`)
+• Vendor price tracking
+• Supplier invoice parser (`services/receiving/service.py`)
+• File upload system
+• Vendor price history logging
+• Local AI assistant via Ollama
+
+Dashboard launches with:
+
+python3 -m streamlit run dashboard.py
+
+---
+
+# Current Development Branch
+
+foundation/professionalize-dude
+
+Active PR:
+
+Add ingestion pipeline + automation foundation
+
+---
+
+# Current Goal
+
+Build the **first automated backend ingestion pipeline**
+
+Target file:
+
+workers/ingest_worker.py
+
+Purpose:
+
+Automatically process uploaded supplier invoices.
+
+Pipeline goal:
+
+Upload File
+↓
+upload_queue.jsonl
+↓
+ingest_worker.py
+↓
+ReceivingService parser
+↓
+vendor_prices database
+↓
+vendor price history
+
+---
+
+# Next Tasks
+
+1. Build `workers/ingest_worker.py`
+2. Normalize supplier item names
+3. Add inventory tracking
+4. Build reorder recommendation engine
+5. Integrate POS data (Toast or Square)
+
+---
+
+# Future Vision
+
+D.U.D.E becomes an **AI Restaurant Operating System** capable of:
+
+• Food cost tracking
+• Vendor price monitoring
+• Automatic invoice ingestion
+• Inventory prediction
+• AI reorder recommendations
+• POS analytics
+
+Target users:
+
+Independent restaurants and multi-location operators.
+
+---
+
+# Notes for Codex / AI Agents
+
+Focus on **small isolated tasks**.
+
+Do not refactor unrelated files.
+
+Prefer adding modules inside:
+
+services/
+workers/
+docs/
+
+Keep the dashboard functional during development.
+
+
 # DUDE Current State
 
 ## Purpose
