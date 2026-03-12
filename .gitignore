@@ -1,3 +1,10 @@
+venv/
+uploads/
+upload_queue.jsonl
+audit_log.jsonl
+*.pyc
+__pycache__/
+
 .venv/
 __pycache__/
 *.pyc
