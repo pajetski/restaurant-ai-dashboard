@@ -2,10 +2,16 @@
 __pycache__/
 *.pyc
 .DS_Store
-data.json
+.env
+.pytest_cache/
 
-*.bak
-*backup*.py
+# runtime data (never commit real business data)
+data/
+data.json
+audit_log.jsonl
+vendor_price_history.csv
+upload_queue.jsonl
+uploads/
 
 *.bak
 *backup*.py

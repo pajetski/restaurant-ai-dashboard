@@ -1,24 +1,13 @@
 #!/usr/bin/env bash
+# Local dev launcher. Reads .env if present.
 set -euo pipefail
-
-APP_FILE="dashboard.py"
-VENV_DIR=".venv"
-
 cd "$(dirname "$0")"
 
 command -v python3 >/dev/null 2>&1 || { echo "python3 not found"; exit 1; }
-
-if [ ! -d "$VENV_DIR" ]; then
-  echo "Creating virtual environment..."
-  python3 -m venv "$VENV_DIR"
-fi
-
+[ -d .venv ] || python3 -m venv .venv
 # shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
+source .venv/bin/activate
+python -m pip install -q -r requirements.txt
 
-python -m pip install --upgrade pip >/dev/null
-python -m pip install -q streamlit pandas requests
-
-echo "Launching Streamlit..."
-exec streamlit run "$APP_FILE"
-
+if [ -f .env ]; then set -a; source .env; set +a; fi
+exec streamlit run dashboard.py
